@@ -73,7 +73,9 @@ A conversational AI chatbot for collecting insurance quotes, built with FastAPI 
    This will start:
    - Backend API on `http://localhost:8000`
    - Frontend on `http://localhost:5173`
-   - PostgreSQL database on `localhost:5432`
+
+
+- **To access the database, I used Datagrip to view the database after establishing connection using:
 
 
 
