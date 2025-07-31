@@ -2,7 +2,7 @@
 
 A conversational AI chatbot for collecting insurance quotes, built with FastAPI (backend) and React/TypeScript (frontend). The system features both text-based and voice-based interaction modes, with a PostgreSQL database for data persistence.
 
-## 🚀Features
+## Features
 
 - **Dual Interaction Modes**:
   - Text Mode (Click Mode) - Fully functional text-based conversation
@@ -15,7 +15,7 @@ A conversational AI chatbot for collecting insurance quotes, built with FastAPI 
   - Text-to-Speech (TTS) for audio responses
 - **Progress Tracking**: Visual progress indicator for quote completion
 
-## 🏗️ Architecture
+##  Architecture
 
 ### Backend (FastAPI)
 - **FastAPI** for REST API and WebSocket endpoints
@@ -31,7 +31,7 @@ A conversational AI chatbot for collecting insurance quotes, built with FastAPI 
 - **WebSocket client** for real-time communication
 - **Web Audio API** for voice recording
 
-## 📋 Prerequisites
+## Prerequisites
 
 - Python 3.11+
 - Node.js 18+
@@ -41,7 +41,7 @@ A conversational AI chatbot for collecting insurance quotes, built with FastAPI 
   - OpenAI API key
   - Deepgram API key
 
-## 🛠️ Installation & Setup
+## Installation & Setup
 
 ### Using Docker (Recommended)
 
@@ -97,20 +97,9 @@ The chatbot will guide you through collecting:
 7. Commute information
 8. Driver's license details
 
-## 🔧 API Endpoints
 
-### REST Endpoints
-- `GET /api/health` - Health check
-- `GET /api/deepgram-info` - Deepgram configuration status
-- `GET /api/test-deepgram` - Test Deepgram TTS functionality
 
-### WebSocket Endpoints
-- `/ws` - Text-based chat endpoint
-- `/ws/streaming` - Voice streaming endpoint
-- `/ws/test` - WebSocket connectivity test
-- `/ws/echo` - Echo test endpoint
-
-## ⚠️ Known Issues
+##  Known Issues
 
 ### Voice Mode Connectivity
 The voice mode is currently experiencing WebSocket connection issues:
