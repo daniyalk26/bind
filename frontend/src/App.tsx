@@ -2,20 +2,17 @@
 import React, { useState, useEffect } from 'react';
 import ChatWindow from './components/ChatWindow';
 import { ContinuousChatWindow } from './components/ContinuousChatWindow';
-import { WebSocketTest } from './components/WebSocketTest';
 import { wsManager } from './websocketManager';
 
 const App: React.FC = () => {
   const [mode, setMode] = useState<'manual' | 'continuous' | 'test'>('continuous');
 
   useEffect(() => {
-    // Only cleanup when the entire app unmounts (page refresh/close)
     window.addEventListener('beforeunload', () => {
       wsManager.cleanup();
     });
     
     return () => {
-      // Don't cleanup here - let the manager handle it
     };
   }, []);
 
@@ -42,25 +39,15 @@ const App: React.FC = () => {
                 : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
             }`}
           >
-            Click Mode
+            Text Mode
           </button>
-          <button
-            onClick={() => setMode('test')}
-            className={`px-4 py-2 rounded-md font-medium transition-colors ${
-              mode === 'test'
-                ? 'bg-blue-600 text-white'
-                : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
-            }`}
-          >
-            Test WS
-          </button>
+
         </div>
       </div>
 
       {/* Render appropriate component */}
       {mode === 'continuous' && <ContinuousChatWindow />}
       {mode === 'manual' && <ChatWindow />}
-      {mode === 'test' && <WebSocketTest />}
     </div>
   );
 };

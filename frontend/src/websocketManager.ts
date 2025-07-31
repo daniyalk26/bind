@@ -1,5 +1,5 @@
 // src/websocketManager.ts
-// Robust singleton WebSocket manager with proper state management
+// Robust singleton WebSocket manager with grace period for disconnection
 
 import { StreamingWebSocketClient } from './api';
 
@@ -16,10 +16,10 @@ class WebSocketManager {
   private errorSubscribers: Set<(error: string) => void> = new Set();
   private messageQueue: any[] = [];
   private reconnectTimer: NodeJS.Timeout | null = null;
-  private referenceCount = 0;  // Track number of components using the connection
+  private disconnectTimer: NodeJS.Timeout | null = null;
+  private referenceCount = 0;
 
   private constructor() {
-    // Bind methods to ensure correct context
     this.handleMessage = this.handleMessage.bind(this);
     this.handleConnect = this.handleConnect.bind(this);
     this.handleDisconnect = this.handleDisconnect.bind(this);
@@ -53,10 +53,14 @@ class WebSocketManager {
     this.connectionState = 'disconnected';
     this.disconnectSubscribers.forEach(callback => callback());
     
-    // Clear any pending reconnect
+    // Clear any pending timers
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
+    }
+    if (this.disconnectTimer) {
+      clearTimeout(this.disconnectTimer);
+      this.disconnectTimer = null;
     }
   }
 
@@ -66,6 +70,13 @@ class WebSocketManager {
   }
 
   async initialize(): Promise<void> {
+    // Cancel any pending disconnect
+    if (this.disconnectTimer) {
+      clearTimeout(this.disconnectTimer);
+      this.disconnectTimer = null;
+      console.log('[WebSocketManager] Cancelled pending disconnect');
+    }
+
     // If already connected, just return
     if (this.connectionState === 'connected' && this.client?.isConnected()) {
       console.log('[WebSocketManager] Already connected');
@@ -143,6 +154,23 @@ class WebSocketManager {
     }
   }
 
+  private scheduleDisconnect() {
+    // Cancel any existing disconnect timer
+    if (this.disconnectTimer) {
+      clearTimeout(this.disconnectTimer);
+    }
+
+    // Schedule disconnect after grace period
+    this.disconnectTimer = setTimeout(() => {
+      if (this.referenceCount === 0 && this.subscribers.size === 0) {
+        console.log('[WebSocketManager] Grace period elapsed with no subscribers, disconnecting...');
+        this.disconnect();
+      } else {
+        console.log('[WebSocketManager] Grace period elapsed but still have subscribers, keeping connection');
+      }
+    }, 10000); // 10-second grace period
+  }
+
   subscribe(
     onMessage: (data: any) => void,
     onConnect?: () => void,
@@ -152,6 +180,13 @@ class WebSocketManager {
     // Increment reference count
     this.referenceCount++;
     console.log(`[WebSocketManager] Subscribe called, ref count: ${this.referenceCount}`);
+    
+    // Cancel any pending disconnect
+    if (this.disconnectTimer) {
+      clearTimeout(this.disconnectTimer);
+      this.disconnectTimer = null;
+      console.log('[WebSocketManager] Cancelled pending disconnect due to new subscriber');
+    }
     
     // Add subscribers
     this.subscribers.add(onMessage);
@@ -183,13 +218,8 @@ class WebSocketManager {
       
       // Only disconnect if no more subscribers
       if (this.referenceCount === 0 && this.subscribers.size === 0) {
-        console.log('[WebSocketManager] No more subscribers, scheduling disconnect...');
-        // Delay disconnect to allow for quick tab switches
-        setTimeout(() => {
-          if (this.referenceCount === 0 && this.subscribers.size === 0) {
-            this.disconnect();
-          }
-        }, 1000);
+        console.log('[WebSocketManager] No more subscribers, scheduling disconnect with grace period...');
+        this.scheduleDisconnect();
       }
     };
   }
@@ -214,9 +244,14 @@ class WebSocketManager {
     console.log('[WebSocketManager] Disconnecting...');
     this.connectionState = 'disconnecting';
     
+    // Clear all timers
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
+    }
+    if (this.disconnectTimer) {
+      clearTimeout(this.disconnectTimer);
+      this.disconnectTimer = null;
     }
 
     if (this.client) {
@@ -230,11 +265,19 @@ class WebSocketManager {
 
   async cleanup(): Promise<void> {
     console.log('[WebSocketManager] Cleaning up...');
+    
+    // Clear all timers first
+    if (this.disconnectTimer) {
+      clearTimeout(this.disconnectTimer);
+      this.disconnectTimer = null;
+    }
+    
     await this.disconnect();
     this.subscribers.clear();
     this.connectSubscribers.clear();
     this.disconnectSubscribers.clear();
     this.errorSubscribers.clear();
+    this.referenceCount = 0;
   }
 }
 

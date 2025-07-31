@@ -17,15 +17,85 @@ from backend.deepgram_client import DeepgramClientWrapper, StreamingConversation
 from backend.audio_utils import AudioProcessor
 from starlette.websockets import WebSocketState
 from datetime import datetime
-
-
-
+from deepgram import DeepgramClient, DeepgramClientOptions
 
 # ────────────────────────── env / logging
 env_path = Path(__file__).parent / ".env"
 load_dotenv(dotenv_path=env_path)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# ────────────────────────── Helper functions
+async def safe_send(ws: WebSocket, payload: dict) -> bool:
+    """
+    Safely send JSON data to WebSocket, checking connection state first.
+    Returns True if sent successfully, False otherwise.
+    """
+    try:
+        # Check if WebSocket is still connected
+        if hasattr(ws, 'client_state') and ws.client_state != WebSocketState.CONNECTED:
+            logger.debug("WebSocket not connected, skipping send")
+            return False
+        
+        # For older Starlette versions, check application_state
+        if hasattr(ws, 'application_state') and ws.application_state != WebSocketState.CONNECTED:
+            logger.debug("WebSocket not connected, skipping send")
+            return False
+            
+        await ws.send_json(payload)
+        return True
+        
+    except WebSocketDisconnect:
+        logger.debug("Client disconnected during send")
+        return False
+    except ConnectionClosedError:
+        logger.debug("Connection closed during send")
+        return False
+    except RuntimeError as e:
+        # Handle "Cannot call send on a WebSocket that has not been accepted"
+        if "has not been accepted" in str(e):
+            logger.debug("WebSocket not yet accepted")
+        else:
+            logger.error(f"Runtime error during send: {e}")
+        return False
+    except Exception as e:
+        logger.error(f"Unexpected error during send: {e}")
+        return False
+
+async def safe_send_text(ws: WebSocket, text: str) -> bool:
+    """
+    Safely send text data to WebSocket, checking connection state first.
+    Returns True if sent successfully, False otherwise.
+    """
+    try:
+        # Check if WebSocket is still connected
+        if hasattr(ws, 'client_state') and ws.client_state != WebSocketState.CONNECTED:
+            logger.debug("WebSocket not connected, skipping send")
+            return False
+        
+        # For older Starlette versions, check application_state
+        if hasattr(ws, 'application_state') and ws.application_state != WebSocketState.CONNECTED:
+            logger.debug("WebSocket not connected, skipping send")
+            return False
+            
+        await ws.send_text(text)
+        return True
+        
+    except WebSocketDisconnect:
+        logger.debug("Client disconnected during send")
+        return False
+    except ConnectionClosedError:
+        logger.debug("Connection closed during send")
+        return False
+    except RuntimeError as e:
+        if "has not been accepted" in str(e):
+            logger.debug("WebSocket not yet accepted")
+        else:
+            logger.error(f"Runtime error during send: {e}")
+        return False
+    except Exception as e:
+        logger.error(f"Unexpected error during send: {e}")
+        return False
 
 # ────────────────────────── FastAPI scaffolding
 @asynccontextmanager
@@ -82,30 +152,58 @@ async def _apply_valid_input(db, user, state, parsed, state_data):
 # ────────────────────────── Original WebSocket endpoint (kept for compatibility)
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket, db: AsyncSession = Depends(get_session)):
-    await ws.accept()
-    # allow either ?session=… or x-session-id header
+    # Generate unique session ID for this connection to avoid conflicts with streaming
     session_id = ws.query_params.get("session") or ws.headers.get("x-session-id") or ws.client.host
-    user       = await crud.get_or_create_user(db, session_id)
-
-    async def send(payload: dict):
+    # Add suffix to differentiate from streaming sessions
+    session_id = f"{session_id}_chat"
+    
+    try:
+        await ws.accept()
+        logger.info(f"Chat WebSocket accepted: {session_id}")
+    except Exception as e:
+        logger.error(f"Failed to accept WebSocket: {e}")
+        return
+    
+    try:
+        user = await crud.get_or_create_user(db, session_id)
+    except Exception as e:
+        logger.error(f"Error creating user: {e}")
+        await safe_send(ws, {"type": "error", "message": "Session initialization failed"})
         try:
-            await ws.send_json(payload)
-        except (WebSocketDisconnect, ConnectionClosedError):
-            raise
+            await ws.close()
+        except:
+            pass
+        return
 
-    # initial greeting
+    # Wait a moment for connection to stabilize
+    await asyncio.sleep(0.1)
+
+    # Initial greeting
     first_state = ConversationState.start
-    first_text  = await ai_client.generate_response(first_state.value, engine.get_prompt(first_state))
-    await send({"type": "bot_message", "content": first_text, "data": {"state": first_state.value}})
+    first_text = await ai_client.generate_response(first_state.value, engine.get_prompt(first_state))
+    
+    # Use safe_send for all messages
+    success = await safe_send(ws, {"type": "bot_message", "content": first_text, "data": {"state": first_state.value}})
+    if not success:
+        logger.warning("Failed to send initial greeting - client disconnected")
+        return
+        
     await crud.save_message(db, user.id, "assistant", first_text)
     await crud.update_session_state(db, user.id, ConversationState.collecting_zip.value)
 
-    # ─────────────── conversation loop
+    # Conversation loop
     try:
         while True:
-            frame = await ws.receive_json()
+            try:
+                frame = await asyncio.wait_for(ws.receive_json(), timeout=60.0)
+            except asyncio.TimeoutError:
+                # Send ping to check if connection is alive
+                if not await safe_send(ws, {"type": "ping"}):
+                    logger.warning("Ping failed, closing connection")
+                    break
+                continue
 
-            # 1️⃣  Convert incoming frame → user_text
+            # Convert incoming frame → user_text
             if frame.get("type") == "user_audio":
                 try:
                     pcm = base64.b64decode(frame["content"])
@@ -114,6 +212,9 @@ async def websocket_endpoint(ws: WebSocket, db: AsyncSession = Depends(get_sessi
                 user_text = await dg_client.transcribe_once(pcm)
             elif frame.get("type") == "user_message":
                 user_text = frame.get("content", "").strip()
+            elif frame.get("type") == "pong":
+                # Client responded to ping
+                continue
             else:
                 continue
 
@@ -122,22 +223,22 @@ async def websocket_endpoint(ws: WebSocket, db: AsyncSession = Depends(get_sessi
 
             await crud.save_message(db, user.id, "user", user_text)
 
-            # 2️⃣  Validate / route
-            session     = await crud.get_session(db, user.id)
-            cur_state   = ConversationState(session.current_state)
-            state_data  = json.loads(session.state_data)
+            # Validate / route
+            session = await crud.get_session(db, user.id)
+            cur_state = ConversationState(session.current_state)
+            state_data = json.loads(session.state_data)
 
             ok, parsed, err = engine.validate_input(cur_state, user_text)
             if not ok:
                 err_msg = await ai_client.generate_error_response(cur_state.value, user_text, err)
-                await send({"type": "bot_message", "content": err_msg})
+                await safe_send(ws, {"type": "bot_message", "content": err_msg})
                 await crud.save_message(db, user.id, "assistant", err_msg)
                 continue
 
             await _apply_valid_input(db, user, cur_state, parsed, state_data)
             next_state = engine.get_next_state(cur_state, parsed, state_data)
 
-            # 3️⃣  Create assistant reply (OpenAI for wording)
+            # Create assistant reply
             reply_text = await ai_client.generate_response(
                 next_state.value,
                 engine.get_prompt(next_state),
@@ -147,57 +248,57 @@ async def websocket_endpoint(ws: WebSocket, db: AsyncSession = Depends(get_sessi
             await crud.update_session_state(db, user.id, next_state.value, state_data)
             await crud.save_message(db, user.id, "assistant", reply_text)
 
-            # 4️⃣  Synthesize voice  (Deepgram TTS)
+            # Synthesize voice
             try:
                 mp3_bytes = await dg_client.tts_once(reply_text)
-                mp3_b64   = base64.b64encode(mp3_bytes).decode() if mp3_bytes else None
+                mp3_b64 = base64.b64encode(mp3_bytes).decode() if mp3_bytes else None
             except Exception as e:
                 logger.warning("Deepgram TTS failed: %s", e)
                 mp3_b64 = None
 
-            # 5️⃣  Send packets back to browser
-            await send({"type": "bot_message", "content": reply_text,
-                        "data": {"state": next_state.value}})
+            # Send packets back to browser
+            await safe_send(ws, {"type": "bot_message", "content": reply_text, "data": {"state": next_state.value}})
             if mp3_b64:
-                await send({"type": "bot_audio", "content": mp3_b64})
-            await send({"type": "state_update",
-                        "data": {"current_state": next_state.value,
-                                 "progress": engine.calculate_progress(next_state)}})
+                await safe_send(ws, {"type": "bot_audio", "content": mp3_b64})
+            await safe_send(ws, {
+                "type": "state_update",
+                "data": {
+                    "current_state": next_state.value,
+                    "progress": engine.calculate_progress(next_state)
+                }
+            })
+            
     except WebSocketDisconnect:
         logger.info("WS closed by client %s", session_id)
     except Exception as exc:
         logger.exception("WS error: %s", exc)
-        try: 
-            await ws.close()
-        except Exception: 
+    finally:
+        try:
+            if hasattr(ws, 'client_state') and ws.client_state == WebSocketState.CONNECTED:
+                await ws.close()
+            elif hasattr(ws, 'application_state') and ws.application_state == WebSocketState.CONNECTED:
+                await ws.close()
+        except:
             pass
 
-
 # ────────────────────────── NEW: Streaming WebSocket endpoint for continuous conversation
-# backend/main.py - Fixed streaming endpoint section
-# (Keep all the existing code, just replace the streaming_websocket_endpoint function)
-
-# backend/main.py - Fixed streaming endpoint with proper error handling
-
-# backend/main.py - Updated streaming endpoint with lazy Deepgram initialization
-
-# Fixed streaming_websocket_endpoint for main.py
-# Replace the existing streaming_websocket_endpoint function with this:
-
-# Fixed streaming_websocket_endpoint for main.py
-# Replace the existing streaming_websocket_endpoint function with this:
-
 @app.websocket("/ws/streaming")
 async def streaming_websocket_endpoint(ws: WebSocket, db: AsyncSession = Depends(get_session)):
     """
     Enhanced WebSocket endpoint for continuous voice conversation using Deepgram streaming.
     """
-    await ws.accept()
     session_id = ws.query_params.get("session") or ws.headers.get("x-session-id") or ws.client.host
+    logger.info(f"New streaming connection attempt: {session_id}")
     
-    logger.info(f"New streaming connection: {session_id}")
+    # Accept the connection first
+    try:
+        await ws.accept()
+        logger.info(f"Streaming connection accepted: {session_id}")
+    except Exception as e:
+        logger.error(f"Failed to accept WebSocket: {e}")
+        return
     
-    # Create a flag to track if we should process messages
+    # Create flags and state
     is_ready = False
     connection_alive = True
     
@@ -206,8 +307,8 @@ async def streaming_websocket_endpoint(ws: WebSocket, db: AsyncSession = Depends
         user = await crud.get_or_create_user(db, session_id)
     except Exception as e:
         logger.error(f"Error creating user: {e}")
+        await safe_send(ws, {"type": "error", "message": "Session initialization failed"})
         try:
-            await ws.send_json({"type": "error", "message": "Session initialization failed"})
             await ws.close()
         except:
             pass
@@ -218,20 +319,6 @@ async def streaming_websocket_endpoint(ws: WebSocket, db: AsyncSession = Depends
     deepgram_connected = False
     audio_chunks_received = 0
     
-    async def send(payload: dict):
-        """Send message to WebSocket with error handling"""
-        try:
-            if ws.client_state == WebSocketState.CONNECTED:
-                await ws.send_json(payload)
-                return True
-        except (WebSocketDisconnect, ConnectionClosedError) as e:
-            logger.warning(f"WebSocket disconnected while sending: {e}")
-            raise
-        except Exception as e:
-            logger.error(f"Error sending WebSocket message: {e}")
-            return False
-        return False
-    
     async def process_user_utterance(user_text: str):
         """Process complete user utterance and generate response"""
         if not user_text.strip() or not connection_alive:
@@ -241,7 +328,7 @@ async def streaming_websocket_endpoint(ws: WebSocket, db: AsyncSession = Depends
             logger.info(f"Processing utterance: {user_text}")
             
             # Send processing indicator
-            await send({"type": "processing", "text": user_text})
+            await safe_send(ws, {"type": "processing", "text": user_text})
             
             # Save user message
             await crud.save_message(db, user.id, "user", user_text)
@@ -261,14 +348,14 @@ async def streaming_websocket_endpoint(ws: WebSocket, db: AsyncSession = Depends
             if not ok:
                 # Handle validation error
                 err_msg = await ai_client.generate_error_response(cur_state.value, user_text, err)
-                await send({"type": "bot_message", "content": err_msg})
+                await safe_send(ws, {"type": "bot_message", "content": err_msg})
                 await crud.save_message(db, user.id, "assistant", err_msg)
                 
                 # Generate error audio
                 try:
                     err_audio = await dg_client.tts_once(err_msg)
                     if err_audio:
-                        await send({
+                        await safe_send(ws, {
                             "type": "bot_audio", 
                             "content": base64.b64encode(err_audio).decode()
                         })
@@ -292,7 +379,7 @@ async def streaming_websocket_endpoint(ws: WebSocket, db: AsyncSession = Depends
             await crud.save_message(db, user.id, "assistant", reply_text)
             
             # Send text response immediately
-            await send({
+            await safe_send(ws, {
                 "type": "bot_message",
                 "content": reply_text,
                 "data": {"state": next_state.value}
@@ -300,13 +387,13 @@ async def streaming_websocket_endpoint(ws: WebSocket, db: AsyncSession = Depends
             
             # Mark bot as speaking
             streaming_manager.is_bot_speaking = True
-            await send({"type": "bot_speaking", "status": True})
+            await safe_send(ws, {"type": "bot_speaking", "status": True})
             
             # Generate and send audio
             try:
                 mp3_bytes = await dg_client.tts_once(reply_text)
                 if mp3_bytes:
-                    await send({
+                    await safe_send(ws, {
                         "type": "bot_audio",
                         "content": base64.b64encode(mp3_bytes).decode()
                     })
@@ -316,7 +403,7 @@ async def streaming_websocket_endpoint(ws: WebSocket, db: AsyncSession = Depends
                 logger.error(f"TTS failed: {e}")
             
             # Send progress update
-            await send({
+            await safe_send(ws, {
                 "type": "state_update",
                 "data": {
                     "current_state": next_state.value,
@@ -324,19 +411,18 @@ async def streaming_websocket_endpoint(ws: WebSocket, db: AsyncSession = Depends
                 }
             })
             
-        except WebSocketDisconnect:
-            logger.info("WebSocket disconnected during utterance processing")
-            raise
         except Exception as e:
             logger.error(f"Error processing utterance: {e}", exc_info=True)
-            try:
-                await send({"type": "error", "message": "Sorry, I encountered an error. Please try again."})
-            except:
-                pass
+            await safe_send(ws, {"type": "error", "message": "Sorry, I encountered an error. Please try again."})
     
     try:
         # Add a small delay to ensure WebSocket is fully established
-        await asyncio.sleep(0.1)
+        await asyncio.sleep(0.2)
+        
+        # Check connection is still alive
+        if not connection_alive:
+            logger.warning("Connection closed before initialization")
+            return
         
         # Send initial greeting with audio
         first_state = ConversationState.start
@@ -345,20 +431,15 @@ async def streaming_websocket_endpoint(ws: WebSocket, db: AsyncSession = Depends
             engine.get_prompt(first_state) + "\n\nKeep it very brief and conversational."
         )
         
-        # Check if connection is still alive before sending
-        if ws.client_state != WebSocketState.CONNECTED:
-            logger.warning("WebSocket disconnected before sending greeting")
-            return
-        
         # Send greeting text
-        success = await send({
+        success = await safe_send(ws, {
             "type": "bot_message",
             "content": first_text,
             "data": {"state": first_state.value}
         })
         
         if not success:
-            logger.error("Failed to send initial greeting")
+            logger.error("Failed to send initial greeting - client disconnected")
             return
             
         await crud.save_message(db, user.id, "assistant", first_text)
@@ -367,7 +448,7 @@ async def streaming_websocket_endpoint(ws: WebSocket, db: AsyncSession = Depends
         try:
             greeting_audio = await dg_client.tts_once(first_text)
             if greeting_audio:
-                await send({
+                await safe_send(ws, {
                     "type": "bot_audio",
                     "content": base64.b64encode(greeting_audio).decode()
                 })
@@ -380,7 +461,7 @@ async def streaming_websocket_endpoint(ws: WebSocket, db: AsyncSession = Depends
         
         # Mark as ready for streaming
         is_ready = True
-        await send({"type": "ready", "message": "Streaming ready"})
+        await safe_send(ws, {"type": "ready", "message": "Streaming ready"})
         
         # Main message loop
         while connection_alive:
@@ -410,13 +491,13 @@ async def streaming_websocket_endpoint(ws: WebSocket, db: AsyncSession = Depends
                                 streaming_manager.handle_speech_started(ws)
                             ),
                             on_error=lambda error: asyncio.create_task(
-                                send({"type": "error", "message": f"Audio error: {error}"})
+                                safe_send(ws, {"type": "error", "message": f"Audio error: {error}"})
                             )
                         )
                         
                         if not deepgram_connected:
                             logger.error("Deepgram connection failed")
-                            await send({
+                            await safe_send(ws, {
                                 "type": "error",
                                 "message": "Could not start audio transcription. Please try again."
                             })
@@ -440,19 +521,23 @@ async def streaming_websocket_endpoint(ws: WebSocket, db: AsyncSession = Depends
                 elif message.get("type") == "bot_finished_speaking":
                     # Bot finished speaking, ready for next input
                     streaming_manager.is_bot_speaking = False
-                    await send({"type": "bot_speaking", "status": False})
+                    await safe_send(ws, {"type": "bot_speaking", "status": False})
                     
                 elif message.get("type") == "keep_alive":
                     # Acknowledge keep-alive
                     logger.debug("Keep-alive received")
+                    # Send pong back
+                    await safe_send(ws, {"type": "pong"})
                     
                 elif message.get("type") == "stop":
                     logger.info("Stop command received")
                     break
                     
             except asyncio.TimeoutError:
-                logger.warning("WebSocket receive timeout - connection may be stale")
-                break
+                logger.warning("WebSocket receive timeout - sending ping")
+                if not await safe_send(ws, {"type": "ping"}):
+                    logger.warning("Ping failed, closing connection")
+                    break
             except json.JSONDecodeError as e:
                 logger.error(f"Invalid JSON received: {e}")
                 continue
@@ -478,20 +563,20 @@ async def streaming_websocket_endpoint(ws: WebSocket, db: AsyncSession = Depends
                 await dg_client.stop_streaming_transcription()
             except Exception as e:
                 logger.error(f"Error stopping Deepgram: {e}")
+        
+        # Safe close
         try:
-            await ws.close()
-        except:
-            pass
+            if hasattr(ws, 'client_state') and ws.client_state == WebSocketState.CONNECTED:
+                await ws.close()
+            elif hasattr(ws, 'application_state') and ws.application_state == WebSocketState.CONNECTED:
+                await ws.close()
+        except Exception as e:
+            logger.debug(f"Error closing WebSocket: {e}")
 
-# ────────────────────────── simple health-check
+# ────────────────────────── API endpoints
 @app.get("/api/health")
 async def health(): 
     return {"status": "healthy", "service": "Bind IQ Chatbot"}
-
-
-# Fixed test endpoint for main.py
-# Add this endpoint to your main.py to check Deepgram version and test the API
-from deepgram import DeepgramClient, DeepgramClientOptions
 
 @app.get("/api/deepgram-info")
 async def deepgram_info():
@@ -556,112 +641,40 @@ async def deepgram_info():
             "error": str(e),
             "api_key_set": bool(os.getenv("DEEPGRAM_API_KEY"))
         }
-    
-# Add this debug endpoint to your main.py to test basic WebSocket connectivity
 
-@app.websocket("/ws/test")
-async def test_websocket_endpoint(ws: WebSocket):
-    """Simple test endpoint to verify WebSocket connectivity"""
-    client_info = f"{ws.client.host}:{ws.client.port}"
-    
+@app.get("/api/test-deepgram")
+async def test_deepgram():
+    """Test endpoint to verify Deepgram configuration"""
     try:
-        logger.info(f"Test WebSocket connection attempt from {client_info}")
-        await ws.accept()
-        logger.info(f"Test WebSocket accepted for {client_info}")
+        # Test TTS
+        test_text = "Hello, this is a test of the Deepgram text to speech system."
+        audio_bytes = await dg_client.tts_once(test_text)
         
-        # Send immediate test message
-        await ws.send_json({
-            "type": "test",
-            "message": "WebSocket connection successful!",
-            "timestamp": str(asyncio.get_event_loop().time())
-        })
-        
-        # Keep connection alive and echo messages
-        while True:
-            try:
-                data = await asyncio.wait_for(ws.receive_json(), timeout=30.0)
-                logger.info(f"Test WS received: {data}")
-                
-                # Echo the message back
-                await ws.send_json({
-                    "type": "echo",
-                    "original": data,
-                    "timestamp": str(asyncio.get_event_loop().time())
-                })
-                
-                if data.get("type") == "close":
-                    break
-                    
-            except asyncio.TimeoutError:
-                # Send ping to keep connection alive
-                await ws.send_json({"type": "ping"})
-                
-    except WebSocketDisconnect:
-        logger.info(f"Test WebSocket disconnected by client {client_info}")
-    except Exception as e:
-        logger.error(f"Test WebSocket error for {client_info}: {e}", exc_info=True)
-    finally:
-        logger.info(f"Test WebSocket closed for {client_info}")
-
-    # Add this endpoint to your main.py to check Deepgram version and test the API
-
-@app.get("/api/deepgram-info")
-async def deepgram_info():
-    """Get Deepgram SDK version and test basic functionality"""
-    import deepgram
-    import pkg_resources
-    
-    try:
-        # Get version
-        try:
-            dg_version = pkg_resources.get_distribution("deepgram-sdk").version
-        except:
-            dg_version = "unknown"
+        # Test if we got audio back
+        tts_working = len(audio_bytes) > 0 if audio_bytes else False
+        audio_size = len(audio_bytes) if audio_bytes else 0
         
         # Check if API key is set
         api_key_set = bool(os.getenv("DEEPGRAM_API_KEY"))
-        api_key_prefix = os.getenv("DEEPGRAM_API_KEY", "")[:10] + "..." if api_key_set else "NOT SET"
-        
-        # Test client initialization
-        client_ok = False
-        client_error = None
-        try:
-            test_client = DeepgramClient(os.getenv("DEEPGRAM_API_KEY", ""))
-            client_ok = True
-        except Exception as e:
-            client_error = str(e)
-        
-        # Get available attributes
-        dg_attrs = []
-        if client_ok:
-            dg_attrs = [attr for attr in dir(test_client) if not attr.startswith('_')]
         
         return {
             "status": "ok",
-            "deepgram_version": dg_version,
-            "api_key_set": api_key_set,
-            "api_key_prefix": api_key_prefix,
-            "client_initialization": {
-                "success": client_ok,
-                "error": client_error
+            "deepgram_api_key_set": api_key_set,
+            "tts_test": {
+                "working": tts_working,
+                "audio_size": audio_size
             },
-            "available_attributes": dg_attrs,
-            "has_listen": "listen" in dg_attrs,
-            "has_speak": "speak" in dg_attrs,
-            "has_transcription": "transcription" in dg_attrs,  # Old API
-            "python_deepgram_module": str(deepgram.__file__) if hasattr(deepgram, '__file__') else "unknown"
+            "message": "Deepgram configuration verified" if tts_working else "Deepgram test failed"
         }
     except Exception as e:
-        logger.error(f"Deepgram info failed: {e}")
+        logger.error(f"Deepgram test failed: {e}")
         return {
             "status": "error",
-            "error": str(e)
+            "error": str(e),
+            "deepgram_api_key_set": bool(os.getenv("DEEPGRAM_API_KEY"))
         }
 
-# Add these debug endpoints to your main.py to test WebSocket connectivity
-# Add these debug endpoints to your main.py to test WebSocket connectivity
-from datetime import datetime
-
+# ────────────────────────── Debug WebSocket endpoints
 @app.websocket("/ws/echo")
 async def echo_websocket(ws: WebSocket):
     """Simple echo WebSocket for testing - no dependencies"""
@@ -697,8 +710,7 @@ async def echo_websocket(ws: WebSocket):
         logger.info(f"Echo WebSocket disconnected: {client_info}")
     except Exception as e:
         logger.error(f"Echo WebSocket error: {e}")
-        
-        
+
 @app.websocket("/ws/test")
 async def test_websocket_endpoint(ws: WebSocket):
     """Simple test endpoint to verify WebSocket connectivity"""
@@ -744,5 +756,4 @@ async def test_websocket_endpoint(ws: WebSocket):
     except Exception as e:
         logger.error(f"Test WebSocket error for {client_info}: {e}", exc_info=True)
     finally:
-        logger.info(f"Test WebSocket closed for {client_info}")        
-        
+        logger.info(f"Test WebSocket closed for {client_info}")
