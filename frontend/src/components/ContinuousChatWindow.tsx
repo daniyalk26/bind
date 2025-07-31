@@ -2,7 +2,7 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
 import MessageBubble from './MessageBubble';
 import { TranscriptDrawer } from './TranscriptDrawer';
-import { StreamingWebSocketClient } from '../api';
+import { wsManager } from '../websocketManager';
 
 /* ------------------------------------------------------------------ */
 /*  Types                                                             */
@@ -26,6 +26,7 @@ const ContinuousChatWindow: React.FC = () => {
   /* ---------------- state ---------------- */
   const [messages, setMessages] = useState<Message[]>([]);
   const [isConnected, setIsConnected] = useState(false);
+  const [userClicked, setUserClicked] = useState(false);
   const [isListening, setIsListening] = useState(false);
   const [isBotSpeaking, setIsBotSpeaking] = useState(false);
   const [isUserSpeaking, setIsUserSpeaking] = useState(false);
@@ -37,12 +38,63 @@ const ContinuousChatWindow: React.FC = () => {
   });
   const [showTranscript, setShowTranscript] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [isStreamingReady, setIsStreamingReady] = useState(false);
 
   /* ---------------- refs ---------------- */
-  const wsClient = useRef<StreamingWebSocketClient | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const currentAudioRef = useRef<HTMLAudioElement | null>(null);
   const audioQueueRef = useRef<string[]>([]);
+  const conversationActiveRef = useRef(false);
+  const unsubscribeRef = useRef<(() => void) | null>(null);
+
+  /* ------------------------------------------------------------------ */
+  /*  Audio playback management                                         */
+  /* ------------------------------------------------------------------ */
+  const playNextAudio = useCallback(() => {
+    // Check if user has interacted using DOM attribute
+    const hasUserInteracted = document.body.getAttribute('data-user-clicked') === 'true';
+    
+    if (!hasUserInteracted || currentAudioRef.current || audioQueueRef.current.length === 0) {
+      return;
+    }
+
+    const audioBase64 = audioQueueRef.current.shift();
+    if (!audioBase64) return;
+
+    try {
+      const bytes = Uint8Array.from(atob(audioBase64), c => c.charCodeAt(0));
+      const blob = new Blob([bytes], { type: 'audio/mpeg' });
+      const url = URL.createObjectURL(blob);
+      const audio = new Audio(url);
+
+      audio.onended = () => {
+        currentAudioRef.current = null;
+        URL.revokeObjectURL(url);
+        // Notify backend that bot finished speaking
+        const client = wsManager.getClient();
+        if (client?.isConnected()) {
+          client.send({ type: 'bot_finished_speaking' });
+        }
+        // Play next audio if available
+        setTimeout(() => playNextAudio(), 100);
+      };
+
+      audio.onerror = (err) => {
+        console.error('[Audio] Playback failed', err);
+        currentAudioRef.current = null;
+        audioQueueRef.current = [];
+      };
+
+      currentAudioRef.current = audio;
+      audio.play().catch(err => {
+        console.warn('[Audio] autoplay blocked', err);
+        currentAudioRef.current = null;
+      });
+
+    } catch (err) {
+      console.error('[Audio] Failed to create audio', err);
+    }
+  }, []);
 
   /* ------------------------------------------------------------------ */
   /*  WebSocket message handler                                         */
@@ -70,7 +122,8 @@ const ContinuousChatWindow: React.FC = () => {
         // Queue audio for playback
         if (data.content) {
           audioQueueRef.current.push(data.content);
-          playNextAudio();
+          // Use setTimeout to ensure state is updated
+          setTimeout(() => playNextAudio(), 0);
         }
         break;
 
@@ -109,81 +162,145 @@ const ContinuousChatWindow: React.FC = () => {
         break;
 
       case 'ready':
-        console.log('Streaming ready');
-        setIsListening(true);
+        console.log('Backend streaming ready, starting audio...');
+        setIsStreamingReady(true);
+        // Only start audio streaming after backend is ready
+        if (conversationActiveRef.current) {
+          const client = wsManager.getClient();
+          if (client?.isConnected()) {
+            // Add a small delay to ensure everything is initialized
+            setTimeout(() => {
+              client.startStreaming().then(started => {
+                if (started) {
+                  setIsListening(true);
+                } else {
+                  setError('Failed to start audio streaming. Please check microphone permissions.');
+                  setConversationActive(false);
+                  conversationActiveRef.current = false;
+                }
+              });
+            }, 100);
+          }
+        }
         break;
 
       case 'error':
         setError(data.message);
         console.error('[WS Error]', data.message);
+        // If we get an error, stop the conversation
+        if (conversationActiveRef.current) {
+          stopConversation();
+        }
         break;
     }
-  }, []);
+  }, [playNextAudio]);
 
   /* ------------------------------------------------------------------ */
-  /*  Audio playback management                                         */
+  /*  Stop conversation callback                                        */
   /* ------------------------------------------------------------------ */
-  const playNextAudio = useCallback(() => {
-    if (currentAudioRef.current || audioQueueRef.current.length === 0) {
-      return;
+  const stopConversation = useCallback(() => {
+    console.log('Stopping conversation...');
+    
+    // Update ref immediately
+    conversationActiveRef.current = false;
+    
+    // Stop audio playback
+    if (currentAudioRef.current) {
+      currentAudioRef.current.pause();
+      currentAudioRef.current = null;
     }
-
-    const audioBase64 = audioQueueRef.current.shift();
-    if (!audioBase64) return;
-
-    try {
-      const bytes = Uint8Array.from(atob(audioBase64), c => c.charCodeAt(0));
-      const blob = new Blob([bytes], { type: 'audio/mpeg' });
-      const url = URL.createObjectURL(blob);
-      const audio = new Audio(url);
-
-      audio.onended = () => {
-        currentAudioRef.current = null;
-        // Notify backend that bot finished speaking
-        wsClient.current?.send({ type: 'bot_finished_speaking' });
-        // Play next audio if available
-        setTimeout(() => playNextAudio(), 100);
-      };
-
-      audio.onerror = (err) => {
-        console.error('[Audio] Playback failed', err);
-        currentAudioRef.current = null;
-        audioQueueRef.current = []; // Clear queue on error
-      };
-
-      currentAudioRef.current = audio;
-      audio.play().catch(console.error);
-
-    } catch (err) {
-      console.error('[Audio] Failed to create audio', err);
+    audioQueueRef.current = [];
+    
+    // Stop streaming
+    const client = wsManager.getClient();
+    if (client) {
+      client.stopStreaming();
+      // Only send stop if connected
+      if (client.isConnected()) {
+        client.send({ type: 'stop' });
+      }
     }
+    
+    // Reset states
+    setConversationActive(false);
+    setIsListening(false);
+    setLiveTranscript('');
+    setIsStreamingReady(false);
+    setError(null);
   }, []);
 
   /* ------------------------------------------------------------------ */
   /*  WebSocket lifecycle                                               */
   /* ------------------------------------------------------------------ */
   useEffect(() => {
-    wsClient.current = new StreamingWebSocketClient(
-      handleWebSocketMessage,
-      () => {
-        setIsConnected(true);
-        setError(null);
-      },
-      () => {
-        setIsConnected(false);
-        setIsListening(false);
-        setConversationActive(false);
-      },
-      (error) => setError(error)
-    );
+    let mounted = true;
 
-    wsClient.current.connect();
+    // Initialize WebSocket connection
+    const initConnection = async () => {
+      try {
+        await wsManager.initialize();
+        
+        if (!mounted) return;
 
-    return () => {
-      stopConversation();
-      wsClient.current?.disconnect();
+        // Subscribe to WebSocket events
+        unsubscribeRef.current = wsManager.subscribe(
+          handleWebSocketMessage,
+          () => {
+            if (mounted) {
+              setIsConnected(true);
+              setError(null);
+            }
+          },
+          () => {
+            if (mounted) {
+              setIsConnected(false);
+              setIsListening(false);
+              setConversationActive(false);
+              conversationActiveRef.current = false;
+              setIsStreamingReady(false);
+            }
+          },
+          (error) => {
+            if (mounted) {
+              setError(error);
+            }
+          }
+        );
+
+        // Check if already connected
+        const client = wsManager.getClient();
+        if (client?.isConnected() && mounted) {
+          setIsConnected(true);
+        }
+      } catch (err) {
+        console.error('Failed to initialize WebSocket:', err);
+        if (mounted) {
+          setError('Failed to connect to server');
+        }
+      }
     };
-  }, [handleWebSocketMessage]);
+
+    initConnection();
+
+    // Cleanup on unmount
+    return () => {
+      mounted = false;
+      if (conversationActiveRef.current) {
+        stopConversation();
+      }
+      if (unsubscribeRef.current) {
+        unsubscribeRef.current();
+      }
+      // Don't disconnect the WebSocket here - let the manager handle it
+    };
+  }, [handleWebSocketMessage, stopConversation]);
+
+  /* ------------------------------------------------------------------ */
+  /*  Update conversation active ref when state changes                 */
+  /* ------------------------------------------------------------------ */
+  useEffect(() => {
+    conversationActiveRef.current = conversationActive;
+  }, [conversationActive]);
 
   /* ------------------------------------------------------------------ */
   /*  Scroll to bottom on new message                                  */
@@ -196,43 +313,52 @@ const ContinuousChatWindow: React.FC = () => {
   /*  Conversation controls                                             */
   /* ------------------------------------------------------------------ */
   const startConversation = async () => {
-    if (!wsClient.current?.isConnected()) {
+    const client = wsManager.getClient();
+    if (!client?.isConnected()) {
       setError('Not connected to server');
       return;
     }
 
     setError(null);
+    setUserClicked(true);
+    // Mark user interaction in DOM for playNextAudio
+    document.body.setAttribute('data-user-clicked', 'true');
     console.log('Starting conversation...');
     
+    // Set conversation active - audio will start when we receive 'ready' from backend
+    setConversationActive(true);
+    conversationActiveRef.current = true;
+  };
+
+  // Test microphone function
+  const testMicrophone = async () => {
     try {
-      const started = await wsClient.current.startStreaming();
-      console.log('Streaming started:', started);
-      
-      if (started) {
-        setConversationActive(true);
-        setIsListening(true);
-      } else {
-        setError('Failed to start audio streaming. Please check microphone permissions.');
-      }
-    } catch (error) {
-      console.error('Error starting conversation:', error);
-      setError(`Failed to start: ${error}`);
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      console.log('Microphone test successful:', stream.getAudioTracks());
+      stream.getTracks().forEach(track => track.stop());
+      alert('Microphone access working!');
+    } catch (e: any) {
+      console.error('Microphone test failed:', e);
+      alert('Microphone access failed: ' + e.message);
     }
   };
 
-  const stopConversation = () => {
-    if (currentAudioRef.current) {
-      currentAudioRef.current.pause();
-      currentAudioRef.current = null;
+  // Test Deepgram function
+  const testDeepgram = async () => {
+    try {
+      const response = await fetch('http://localhost:8000/api/test-deepgram');
+      const data = await response.json();
+      console.log('Deepgram test result:', data);
+      
+      if (data.status === 'ok' && data.tts_test.working) {
+        alert('Deepgram is working correctly!');
+      } else {
+        alert(`Deepgram test failed: ${data.error || 'Unknown error'}\n\nAPI Key Set: ${data.deepgram_api_key_set}`);
+      }
+    } catch (e: any) {
+      console.error('Deepgram test failed:', e);
+      alert('Failed to test Deepgram: ' + e.message);
     }
-    audioQueueRef.current = [];
-    
-    wsClient.current?.stopStreaming();
-    wsClient.current?.send({ type: 'stop' });
-    
-    setConversationActive(false);
-    setIsListening(false);
-    setLiveTranscript('');
   };
 
   /* ------------------------------------------------------------------ */
@@ -253,10 +379,25 @@ const ContinuousChatWindow: React.FC = () => {
               {isListening && ' • Listening'}
               {isUserSpeaking && ' • You are speaking'}
               {isBotSpeaking && ' • Assistant is speaking'}
+              {conversationActive && !isStreamingReady && ' • Initializing...'}
             </p>
           </div>
 
           <div className="flex items-center space-x-4">
+            <button
+              onClick={testMicrophone}
+              className="text-sm text-gray-600 hover:text-gray-800"
+            >
+              Test Mic
+            </button>
+
+            <button
+              onClick={testDeepgram}
+              className="text-sm text-gray-600 hover:text-gray-800"
+            >
+              Test Deepgram
+            </button>
+            
             <button
               onClick={() => setShowTranscript(true)}
               className="text-sm text-blue-600 hover:text-blue-700 font-medium"
@@ -330,6 +471,10 @@ const ContinuousChatWindow: React.FC = () => {
             {!conversationActive ? (
               <button
                 onClick={startConversation}
+                onPointerDown={() => {
+                  setUserClicked(true);
+                  document.body.setAttribute('data-user-clicked', 'true');
+                }}
                 disabled={!isConnected || conversationState.currentState === 'completed'}
                 className={`
                   px-8 py-4 rounded-full font-medium text-lg transition-all

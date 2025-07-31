@@ -15,6 +15,10 @@ import json, logging, os, base64, asyncio
 from dotenv import load_dotenv
 from backend.deepgram_client import DeepgramClientWrapper, StreamingConversationManager
 from backend.audio_utils import AudioProcessor
+from starlette.websockets import WebSocketState
+from datetime import datetime
+
+
 
 
 # ────────────────────────── env / logging
@@ -170,6 +174,19 @@ async def websocket_endpoint(ws: WebSocket, db: AsyncSession = Depends(get_sessi
 
 
 # ────────────────────────── NEW: Streaming WebSocket endpoint for continuous conversation
+# backend/main.py - Fixed streaming endpoint section
+# (Keep all the existing code, just replace the streaming_websocket_endpoint function)
+
+# backend/main.py - Fixed streaming endpoint with proper error handling
+
+# backend/main.py - Updated streaming endpoint with lazy Deepgram initialization
+
+# Fixed streaming_websocket_endpoint for main.py
+# Replace the existing streaming_websocket_endpoint function with this:
+
+# Fixed streaming_websocket_endpoint for main.py
+# Replace the existing streaming_websocket_endpoint function with this:
+
 @app.websocket("/ws/streaming")
 async def streaming_websocket_endpoint(ws: WebSocket, db: AsyncSession = Depends(get_session)):
     """
@@ -177,20 +194,52 @@ async def streaming_websocket_endpoint(ws: WebSocket, db: AsyncSession = Depends
     """
     await ws.accept()
     session_id = ws.query_params.get("session") or ws.headers.get("x-session-id") or ws.client.host
-    user = await crud.get_or_create_user(db, session_id)
+    
+    logger.info(f"New streaming connection: {session_id}")
+    
+    # Create a flag to track if we should process messages
+    is_ready = False
+    connection_alive = True
+    
+    # Handle potential duplicate sessions
+    try:
+        user = await crud.get_or_create_user(db, session_id)
+    except Exception as e:
+        logger.error(f"Error creating user: {e}")
+        try:
+            await ws.send_json({"type": "error", "message": "Session initialization failed"})
+            await ws.close()
+        except:
+            pass
+        return
     
     # Create streaming conversation manager
     streaming_manager = StreamingConversationManager(dg_client)
+    deepgram_connected = False
+    audio_chunks_received = 0
     
     async def send(payload: dict):
+        """Send message to WebSocket with error handling"""
         try:
-            await ws.send_json(payload)
-        except (WebSocketDisconnect, ConnectionClosedError):
+            if ws.client_state == WebSocketState.CONNECTED:
+                await ws.send_json(payload)
+                return True
+        except (WebSocketDisconnect, ConnectionClosedError) as e:
+            logger.warning(f"WebSocket disconnected while sending: {e}")
             raise
+        except Exception as e:
+            logger.error(f"Error sending WebSocket message: {e}")
+            return False
+        return False
     
     async def process_user_utterance(user_text: str):
         """Process complete user utterance and generate response"""
+        if not user_text.strip() or not connection_alive:
+            return
+            
         try:
+            logger.info(f"Processing utterance: {user_text}")
+            
             # Send processing indicator
             await send({"type": "processing", "text": user_text})
             
@@ -199,6 +248,10 @@ async def streaming_websocket_endpoint(ws: WebSocket, db: AsyncSession = Depends
             
             # Get current session state
             session = await crud.get_session(db, user.id)
+            if not session:
+                logger.error("No session found for user")
+                return
+                
             cur_state = ConversationState(session.current_state)
             state_data = json.loads(session.state_data)
             
@@ -212,12 +265,15 @@ async def streaming_websocket_endpoint(ws: WebSocket, db: AsyncSession = Depends
                 await crud.save_message(db, user.id, "assistant", err_msg)
                 
                 # Generate error audio
-                err_audio = await dg_client.tts_once(err_msg)
-                if err_audio:
-                    await send({
-                        "type": "bot_audio", 
-                        "content": base64.b64encode(err_audio).decode()
-                    })
+                try:
+                    err_audio = await dg_client.tts_once(err_msg)
+                    if err_audio:
+                        await send({
+                            "type": "bot_audio", 
+                            "content": base64.b64encode(err_audio).decode()
+                        })
+                except Exception as e:
+                    logger.error(f"Error generating error audio: {e}")
                 return
             
             # Apply valid input and get next state
@@ -254,8 +310,10 @@ async def streaming_websocket_endpoint(ws: WebSocket, db: AsyncSession = Depends
                         "type": "bot_audio",
                         "content": base64.b64encode(mp3_bytes).decode()
                     })
+                else:
+                    logger.warning("No audio generated for response")
             except Exception as e:
-                logger.warning(f"TTS failed: {e}")
+                logger.error(f"TTS failed: {e}")
             
             # Send progress update
             await send({
@@ -266,24 +324,43 @@ async def streaming_websocket_endpoint(ws: WebSocket, db: AsyncSession = Depends
                 }
             })
             
+        except WebSocketDisconnect:
+            logger.info("WebSocket disconnected during utterance processing")
+            raise
         except Exception as e:
-            logger.error(f"Error processing utterance: {e}")
-            await send({"type": "error", "message": "Sorry, I encountered an error. Please try again."})
+            logger.error(f"Error processing utterance: {e}", exc_info=True)
+            try:
+                await send({"type": "error", "message": "Sorry, I encountered an error. Please try again."})
+            except:
+                pass
     
-    # Send initial greeting with audio
     try:
+        # Add a small delay to ensure WebSocket is fully established
+        await asyncio.sleep(0.1)
+        
+        # Send initial greeting with audio
         first_state = ConversationState.start
         first_text = await ai_client.generate_response(
             first_state.value,
             engine.get_prompt(first_state) + "\n\nKeep it very brief and conversational."
         )
         
+        # Check if connection is still alive before sending
+        if ws.client_state != WebSocketState.CONNECTED:
+            logger.warning("WebSocket disconnected before sending greeting")
+            return
+        
         # Send greeting text
-        await send({
+        success = await send({
             "type": "bot_message",
             "content": first_text,
             "data": {"state": first_state.value}
         })
+        
+        if not success:
+            logger.error("Failed to send initial greeting")
+            return
+            
         await crud.save_message(db, user.id, "assistant", first_text)
         
         # Generate and send greeting audio
@@ -298,79 +375,374 @@ async def streaming_websocket_endpoint(ws: WebSocket, db: AsyncSession = Depends
                 logger.warning("No audio generated for greeting")
         except Exception as e:
             logger.error(f"TTS generation failed: {e}")
-            await send({"type": "error", "message": f"Audio generation failed: {str(e)}"})
         
         await crud.update_session_state(db, user.id, ConversationState.collecting_zip.value)
         
-        # Start Deepgram streaming
-        logger.info("Starting Deepgram streaming...")
-        streaming_started = await dg_client.start_streaming_transcription(
-            on_transcript=lambda text, is_final:
-                streaming_manager.handle_transcript(text, is_final, ws),
-
-            on_utterance_end=lambda:
-                streaming_manager.handle_utterance_end(process_user_utterance),
-
-            on_speech_started=lambda:
-                streaming_manager.handle_speech_started(ws),
-
-            on_error=lambda err:
-                send({"type": "error", "message": f"Audio error: {err}"})
-        )
-
-        
-        if not streaming_started:
-            await send({"type": "error", "message": "Failed to start audio streaming"})
-            await ws.close()
-            return
-        
+        # Mark as ready for streaming
+        is_ready = True
         await send({"type": "ready", "message": "Streaming ready"})
         
         # Main message loop
-        while True:
-            message = await ws.receive_json()
-            
-            if message.get("type") == "audio_stream":
-                # Forward audio to Deepgram
-                audio_data = base64.b64decode(message["content"])
+        while connection_alive:
+            try:
+                # Use receive_text with timeout to handle disconnections better
+                raw_message = await asyncio.wait_for(ws.receive_text(), timeout=60.0)
+                message = json.loads(raw_message)
                 
-                # Process audio format if needed
-                mime_type = message.get("mime_type", "audio/webm")
-                sample_rate = message.get("sample_rate", 48000)
+                if not is_ready and message.get("type") != "keep_alive":
+                    logger.warning("Received message before ready state")
+                    continue
                 
-                processed_audio = audio_processor.process_browser_audio(
-                    audio_data, 
-                    mime_type=mime_type,
-                    sample_rate=sample_rate
-                )
-                
-                if processed_audio:
-                    await dg_client.send_audio_stream(processed_audio)
-                else:
-                    logger.warning("Failed to process audio chunk")
-                
-            elif message.get("type") == "bot_finished_speaking":
-                # Bot finished speaking, ready for next input
-                streaming_manager.is_bot_speaking = False
-                await send({"type": "bot_speaking", "status": False})
-                
-            elif message.get("type") == "stop":
+                if message.get("type") == "audio_stream":
+                    audio_chunks_received += 1
+                    
+                    # Initialize Deepgram on first audio chunk
+                    if not deepgram_connected:
+                        logger.info(f"First audio chunk received (chunk #{audio_chunks_received}), starting Deepgram streaming...")
+                        deepgram_connected = await dg_client.start_streaming_transcription(
+                            on_transcript=lambda text, is_final: asyncio.create_task(
+                                streaming_manager.handle_transcript(text, is_final, ws)
+                            ),
+                            on_utterance_end=lambda: asyncio.create_task(
+                                streaming_manager.handle_utterance_end(process_user_utterance)
+                            ),
+                            on_speech_started=lambda: asyncio.create_task(
+                                streaming_manager.handle_speech_started(ws)
+                            ),
+                            on_error=lambda error: asyncio.create_task(
+                                send({"type": "error", "message": f"Audio error: {error}"})
+                            )
+                        )
+                        
+                        if not deepgram_connected:
+                            logger.error("Deepgram connection failed")
+                            await send({
+                                "type": "error",
+                                "message": "Could not start audio transcription. Please try again."
+                            })
+                            break
+                    
+                    # Forward audio to Deepgram
+                    try:
+                        audio_data = base64.b64decode(message["content"])
+                        
+                        # Log every 10th chunk to avoid spam
+                        if audio_chunks_received % 10 == 0:
+                            logger.debug(f"Received audio chunk #{audio_chunks_received}, size: {len(audio_data)} bytes")
+                        
+                        # Send to Deepgram
+                        success = await dg_client.send_audio_stream(audio_data)
+                        if not success:
+                            logger.warning(f"Failed to send audio chunk #{audio_chunks_received} to Deepgram")
+                    except Exception as e:
+                        logger.error(f"Error processing audio stream: {e}")
+                    
+                elif message.get("type") == "bot_finished_speaking":
+                    # Bot finished speaking, ready for next input
+                    streaming_manager.is_bot_speaking = False
+                    await send({"type": "bot_speaking", "status": False})
+                    
+                elif message.get("type") == "keep_alive":
+                    # Acknowledge keep-alive
+                    logger.debug("Keep-alive received")
+                    
+                elif message.get("type") == "stop":
+                    logger.info("Stop command received")
+                    break
+                    
+            except asyncio.TimeoutError:
+                logger.warning("WebSocket receive timeout - connection may be stale")
                 break
-                
+            except json.JSONDecodeError as e:
+                logger.error(f"Invalid JSON received: {e}")
+                continue
+            except WebSocketDisconnect:
+                logger.info(f"WebSocket disconnected by client")
+                break
+            except Exception as e:
+                logger.error(f"Error in message loop: {e}", exc_info=True)
+                if "no close frame received" in str(e).lower():
+                    break
+                    
     except WebSocketDisconnect:
         logger.info(f"Streaming WS closed by client {session_id}")
     except Exception as exc:
         logger.exception(f"Streaming WS error: {exc}")
     finally:
+        connection_alive = False
+        logger.info(f"Cleaning up streaming connection for {session_id}. Received {audio_chunks_received} audio chunks.")
+        
         # Clean up
-        await dg_client.stop_streaming_transcription()
+        if deepgram_connected:
+            try:
+                await dg_client.stop_streaming_transcription()
+            except Exception as e:
+                logger.error(f"Error stopping Deepgram: {e}")
         try:
             await ws.close()
         except:
             pass
 
-
 # ────────────────────────── simple health-check
 @app.get("/api/health")
 async def health(): 
     return {"status": "healthy", "service": "Bind IQ Chatbot"}
+
+
+# Fixed test endpoint for main.py
+# Add this endpoint to your main.py to check Deepgram version and test the API
+from deepgram import DeepgramClient, DeepgramClientOptions
+
+@app.get("/api/deepgram-info")
+async def deepgram_info():
+    """Get Deepgram SDK version and test basic functionality"""
+    import deepgram
+    import pkg_resources
+    
+    try:
+        # Get version
+        try:
+            dg_version = pkg_resources.get_distribution("deepgram-sdk").version
+        except:
+            dg_version = "unknown"
+        
+        # Check if API key is set
+        api_key_set = bool(os.getenv("DEEPGRAM_API_KEY"))
+        api_key_prefix = os.getenv("DEEPGRAM_API_KEY", "")[:10] + "..." if api_key_set else "NOT SET"
+        
+        # Test client initialization
+        client_ok = False
+        client_error = None
+        dg_attrs = []
+        
+        try:
+            # Try new initialization method
+            config = DeepgramClientOptions(
+                api_key=os.getenv("DEEPGRAM_API_KEY", "test"),
+                options={"keepalive": "true"}
+            )
+            test_client = DeepgramClient("", config)
+            client_ok = True
+            dg_attrs = [attr for attr in dir(test_client) if not attr.startswith('_')]
+        except Exception as e:
+            # Try old initialization method
+            try:
+                test_client = DeepgramClient(os.getenv("DEEPGRAM_API_KEY", ""))
+                client_ok = True
+                dg_attrs = [attr for attr in dir(test_client) if not attr.startswith('_')]
+            except Exception as e2:
+                client_error = f"New method: {str(e)}, Old method: {str(e2)}"
+        
+        return {
+            "status": "ok",
+            "deepgram_version": dg_version,
+            "api_key_set": api_key_set,
+            "api_key_prefix": api_key_prefix,
+            "client_initialization": {
+                "success": client_ok,
+                "error": client_error
+            },
+            "available_attributes": dg_attrs,
+            "has_listen": "listen" in dg_attrs,
+            "has_speak": "speak" in dg_attrs,
+            "has_transcription": "transcription" in dg_attrs,  # Old API
+            "has_manage": "manage" in dg_attrs,
+            "python_deepgram_module": str(deepgram.__file__) if hasattr(deepgram, '__file__') else "unknown"
+        }
+    except Exception as e:
+        logger.error(f"Deepgram info failed: {e}")
+        return {
+            "status": "error",
+            "error": str(e),
+            "api_key_set": bool(os.getenv("DEEPGRAM_API_KEY"))
+        }
+    
+# Add this debug endpoint to your main.py to test basic WebSocket connectivity
+
+@app.websocket("/ws/test")
+async def test_websocket_endpoint(ws: WebSocket):
+    """Simple test endpoint to verify WebSocket connectivity"""
+    client_info = f"{ws.client.host}:{ws.client.port}"
+    
+    try:
+        logger.info(f"Test WebSocket connection attempt from {client_info}")
+        await ws.accept()
+        logger.info(f"Test WebSocket accepted for {client_info}")
+        
+        # Send immediate test message
+        await ws.send_json({
+            "type": "test",
+            "message": "WebSocket connection successful!",
+            "timestamp": str(asyncio.get_event_loop().time())
+        })
+        
+        # Keep connection alive and echo messages
+        while True:
+            try:
+                data = await asyncio.wait_for(ws.receive_json(), timeout=30.0)
+                logger.info(f"Test WS received: {data}")
+                
+                # Echo the message back
+                await ws.send_json({
+                    "type": "echo",
+                    "original": data,
+                    "timestamp": str(asyncio.get_event_loop().time())
+                })
+                
+                if data.get("type") == "close":
+                    break
+                    
+            except asyncio.TimeoutError:
+                # Send ping to keep connection alive
+                await ws.send_json({"type": "ping"})
+                
+    except WebSocketDisconnect:
+        logger.info(f"Test WebSocket disconnected by client {client_info}")
+    except Exception as e:
+        logger.error(f"Test WebSocket error for {client_info}: {e}", exc_info=True)
+    finally:
+        logger.info(f"Test WebSocket closed for {client_info}")
+
+    # Add this endpoint to your main.py to check Deepgram version and test the API
+
+@app.get("/api/deepgram-info")
+async def deepgram_info():
+    """Get Deepgram SDK version and test basic functionality"""
+    import deepgram
+    import pkg_resources
+    
+    try:
+        # Get version
+        try:
+            dg_version = pkg_resources.get_distribution("deepgram-sdk").version
+        except:
+            dg_version = "unknown"
+        
+        # Check if API key is set
+        api_key_set = bool(os.getenv("DEEPGRAM_API_KEY"))
+        api_key_prefix = os.getenv("DEEPGRAM_API_KEY", "")[:10] + "..." if api_key_set else "NOT SET"
+        
+        # Test client initialization
+        client_ok = False
+        client_error = None
+        try:
+            test_client = DeepgramClient(os.getenv("DEEPGRAM_API_KEY", ""))
+            client_ok = True
+        except Exception as e:
+            client_error = str(e)
+        
+        # Get available attributes
+        dg_attrs = []
+        if client_ok:
+            dg_attrs = [attr for attr in dir(test_client) if not attr.startswith('_')]
+        
+        return {
+            "status": "ok",
+            "deepgram_version": dg_version,
+            "api_key_set": api_key_set,
+            "api_key_prefix": api_key_prefix,
+            "client_initialization": {
+                "success": client_ok,
+                "error": client_error
+            },
+            "available_attributes": dg_attrs,
+            "has_listen": "listen" in dg_attrs,
+            "has_speak": "speak" in dg_attrs,
+            "has_transcription": "transcription" in dg_attrs,  # Old API
+            "python_deepgram_module": str(deepgram.__file__) if hasattr(deepgram, '__file__') else "unknown"
+        }
+    except Exception as e:
+        logger.error(f"Deepgram info failed: {e}")
+        return {
+            "status": "error",
+            "error": str(e)
+        }
+
+# Add these debug endpoints to your main.py to test WebSocket connectivity
+# Add these debug endpoints to your main.py to test WebSocket connectivity
+from datetime import datetime
+
+@app.websocket("/ws/echo")
+async def echo_websocket(ws: WebSocket):
+    """Simple echo WebSocket for testing - no dependencies"""
+    await ws.accept()
+    client_info = f"{ws.client.host}:{ws.client.port}"
+    logger.info(f"Echo WebSocket connected: {client_info}")
+    
+    try:
+        # Send welcome message
+        await ws.send_json({
+            "type": "welcome",
+            "message": "Echo WebSocket connected successfully!",
+            "client": client_info
+        })
+        
+        # Echo loop
+        while True:
+            data = await ws.receive_json()
+            logger.info(f"Echo received: {data}")
+            
+            # Echo back with timestamp
+            await ws.send_json({
+                "type": "echo",
+                "original": data,
+                "timestamp": str(asyncio.get_event_loop().time()),
+                "server_time": datetime.now().isoformat()
+            })
+            
+            if data.get("type") == "close":
+                break
+                
+    except WebSocketDisconnect:
+        logger.info(f"Echo WebSocket disconnected: {client_info}")
+    except Exception as e:
+        logger.error(f"Echo WebSocket error: {e}")
+        
+        
+@app.websocket("/ws/test")
+async def test_websocket_endpoint(ws: WebSocket):
+    """Simple test endpoint to verify WebSocket connectivity"""
+    client_info = f"{ws.client.host}:{ws.client.port}"
+    
+    try:
+        logger.info(f"Test WebSocket connection attempt from {client_info}")
+        await ws.accept()
+        logger.info(f"Test WebSocket accepted for {client_info}")
+        
+        # Add small delay to ensure connection is stable
+        await asyncio.sleep(0.1)
+        
+        # Send immediate test message
+        await ws.send_json({
+            "type": "test",
+            "message": "WebSocket connection successful!",
+            "timestamp": str(asyncio.get_event_loop().time())
+        })
+        
+        # Keep connection alive and echo messages
+        while True:
+            try:
+                data = await asyncio.wait_for(ws.receive_json(), timeout=30.0)
+                logger.info(f"Test WS received: {data}")
+                
+                # Echo the message back
+                await ws.send_json({
+                    "type": "echo",
+                    "original": data,
+                    "timestamp": str(asyncio.get_event_loop().time())
+                })
+                
+                if data.get("type") == "close":
+                    break
+                    
+            except asyncio.TimeoutError:
+                # Send ping to keep connection alive
+                await ws.send_json({"type": "ping"})
+                
+    except WebSocketDisconnect:
+        logger.info(f"Test WebSocket disconnected by client {client_info}")
+    except Exception as e:
+        logger.error(f"Test WebSocket error for {client_info}: {e}", exc_info=True)
+    finally:
+        logger.info(f"Test WebSocket closed for {client_info}")        
+        
