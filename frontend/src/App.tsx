@@ -5,7 +5,7 @@ import { ContinuousChatWindow } from './components/ContinuousChatWindow';
 import { wsManager } from './websocketManager';
 
 const App: React.FC = () => {
-  const [mode, setMode] = useState<'manual' | 'continuous' | 'test'>('continuous');
+  const [mode, setMode] = useState<'manual' | 'continuous' >('manual');
 
   useEffect(() => {
     window.addEventListener('beforeunload', () => {
