@@ -1,13 +1,15 @@
 # backend/openai_client.py
 from openai import AsyncOpenAI
-import os, logging
+import os
+import io
+import base64
+import logging
 from typing import AsyncGenerator, Optional, Union, List, Dict
 
 logger = logging.getLogger(__name__)
 
 
 class OpenAIClient:
-
 
     def __init__(self) -> None:
         api_key = os.getenv("OPENAI_API_KEY")
@@ -104,3 +106,40 @@ class OpenAIClient:
         except Exception as e:
             logger.error("OpenAI error (error-resp): %s", e)
             return f"I didn't understand that—{error_message}"
+
+    # ------------------ speech helpers ------------------ #
+    async def transcribe_audio(self, data: bytes) -> str:
+        """Whisper-based speech-to-text"""
+        try:
+            buf = io.BytesIO(data)
+            buf.name = "audio.webm"  # adjust if frontend sends other formats
+            resp = await self.client.audio.transcriptions.create(
+                model="whisper-1", file=buf, response_format="text"
+            )
+            if isinstance(resp, str):
+                return resp.strip()
+            # some SDKs return dict-like
+            return resp.get("text", "").strip() if isinstance(resp, dict) else ""
+        except Exception as e:
+            logger.error("STT error: %s", e)
+            return ""
+
+    async def synth_speech(self, text: str) -> bytes:
+        """TTS: convert assistant text to audio bytes"""
+        try:
+            resp = await self.client.audio.speech.create(
+                model="tts-1",
+                voice="alloy",
+                input=text,
+            )
+            # Depending on SDK shape:
+            if hasattr(resp, "read"):
+                return resp.read()
+            if hasattr(resp, "content"):
+                return resp.content
+            if isinstance(resp, str):
+                return base64.b64decode(resp)
+            return b""
+        except Exception as e:
+            logger.error("TTS error: %s", e)
+            return b""
